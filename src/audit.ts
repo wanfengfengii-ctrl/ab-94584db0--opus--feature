@@ -1,6 +1,18 @@
 /**
- * Structural audit of a single-logical-stream Ogg Opus file
- * (RFC 3533 + RFC 7845 + RFC 6716).
+ * Structural audit of Ogg Opus files (RFC 3533 + RFC 7845 + RFC 6716).
+ *
+ * Two modes are supported:
+ *
+ * - single stream: the whole file is exactly one logical stream;
+ * - chained (`logical_streams=chained`): the file is a sequence of one
+ *   to sixteen complete logical streams ("links") concatenated end to
+ *   end, as produced by recorders that restart their encoder mid-file.
+ *   Each link is audited with the same per-link rules as a single
+ *   stream; additionally every link must open with a BOS page at
+ *   sequence zero only after the previous link's EOS, link serial
+ *   numbers must be pairwise distinct, links must not interleave or
+ *   continue packets across the boundary, and every OpusHead must
+ *   declare the same channel count as the first link.
  *
  * The auditor is deliberately stricter than a tolerant player: it never
  * re-synchronises after a bad capture pattern, checks every page CRC,
@@ -15,6 +27,7 @@ import { inspectOpusPacket, OpusFormatError } from "./opusToc.ts";
 
 export const MAX_BODY_BYTES = 8 * 1024 * 1024;
 export const MAX_PAGES = 2048;
+export const MAX_LINKS = 16;
 
 const OGG_MAGIC = [0x4f, 0x67, 0x67, 0x53] as const; // "OggS"
 const OPUS_HEAD_MAGIC = 0x4f70757348656164n; // "OpusHead", big-endian bytes
@@ -52,7 +65,10 @@ export type AuditErrorCode =
   | "GRANULE_MISSING"
   | "GRANULE_MISMATCH"
   | "EOS_GRANULE_INVALID"
-  | "STREAM_NOT_TERMINATED";
+  | "STREAM_NOT_TERMINATED"
+  | "TOO_MANY_LINKS"
+  | "SERIAL_NUMBER_REUSED"
+  | "STREAM_INTERLEAVED";
 
 export class AuditError extends Error {
   readonly code: AuditErrorCode;
@@ -76,6 +92,11 @@ export interface AuditResult {
   decodedSamples: number;
   /** Final granule minus pre-skip, clamped at zero. */
   playableSamples: number;
+}
+
+export interface ChainedAuditResult extends AuditResult {
+  /** Number of complete logical streams ("links") found in the file. */
+  linkCount: number;
 }
 
 interface ParsedPage {
@@ -308,7 +329,27 @@ function walkPageSegments(
   return { completed, openChunks: chunks };
 }
 
+/**
+ * Audit a file holding exactly one logical Ogg Opus stream.
+ * Any page after the stream's EOS is rejected.
+ */
 export function auditOggOpus(input: Uint8Array): AuditResult {
+  const { pageCount, audioPacketCount, decodedSamples, playableSamples } = audit(input, false);
+  return { pageCount, audioPacketCount, decodedSamples, playableSamples };
+}
+
+/**
+ * Audit a file holding a chain of one to sixteen complete logical Ogg
+ * Opus streams concatenated end to end. Every link is validated with
+ * the single-stream rules; statistics are aggregated across links and
+ * `playableSamples` sums each link's final granule minus its own
+ * pre-skip, clamped at zero per link.
+ */
+export function auditOggOpusChain(input: Uint8Array): ChainedAuditResult {
+  return audit(input, true);
+}
+
+function audit(input: Uint8Array, chained: boolean): ChainedAuditResult {
   if (input.length === 0) {
     fail("EMPTY_INPUT", null, "request body is empty", 400);
   }
@@ -317,7 +358,9 @@ export function auditOggOpus(input: Uint8Array): AuditResult {
   }
 
   let offset = 0;
-  let pageCount = 0;
+  let pageCount = 0; // global page index across the whole file
+  let linkPageCount = 0; // pages seen so far in the current link
+  let linkCount = 0; // links completed (EOS reached)
   let phase: Phase = "id";
   let serial: number | null = null;
   let expectedSequence = 0;
@@ -328,9 +371,17 @@ export function auditOggOpus(input: Uint8Array): AuditResult {
   let openChunks: Uint8Array[] | null = null;
   let previousEndedOpen = false;
 
+  // Per-link statistics; folded into the chain totals at each EOS.
   let decodedSamples = 0;
   let audioPacketCount = 0;
   let lastAudioGranule: number | null = null;
+
+  // Chain-wide aggregates and cross-link constraints.
+  let totalAudioPackets = 0;
+  let totalDecodedSamples = 0;
+  let totalPlayableSamples = 0;
+  let chainChannels: number | null = null;
+  const seenSerials = new Set<number>();
 
   while (offset < input.length) {
     const index = pageCount;
@@ -345,11 +396,22 @@ export function auditOggOpus(input: Uint8Array): AuditResult {
     const eosFlag = (page.headerType & FLAG_EOS) !== 0;
     const continuedFlag = (page.headerType & FLAG_CONTINUED) !== 0;
     const bosFlag = (page.headerType & FLAG_BOS) !== 0;
+    const firstPageOfLink = linkPageCount === 0;
 
     /* ---- stream-level flag / sequencing checks ---- */
 
-    if (index === 0) {
-      if (!bosFlag || continuedFlag) {
+    if (firstPageOfLink) {
+      if (!bosFlag) {
+        if (chained && linkCount > 0) {
+          fail(
+            "EOS_FLAG_INVALID",
+            index,
+            "page present after end-of-stream; the next link must begin with a BOS page",
+          );
+        }
+        fail("BOS_FLAG_INVALID", index, "first page must be BOS without continuation");
+      }
+      if (continuedFlag) {
         fail("BOS_FLAG_INVALID", index, "first page must be BOS without continuation");
       }
       if (eosFlag) {
@@ -358,8 +420,18 @@ export function auditOggOpus(input: Uint8Array): AuditResult {
       if (page.sequence !== 0) {
         fail("PAGE_SEQUENCE_INVALID", index, "first page sequence number must be 0");
       }
+      if (chained && linkCount >= MAX_LINKS) {
+        fail("TOO_MANY_LINKS", index, `chain exceeds ${MAX_LINKS} logical streams`);
+      }
     } else {
       if (bosFlag) {
+        if (chained) {
+          fail(
+            "STREAM_NOT_TERMINATED",
+            index,
+            "link has no end-of-stream page before the next link begins",
+          );
+        }
         fail("BOS_FLAG_INVALID", index, "BOS flag set after the first page");
       }
       if (page.sequence !== expectedSequence) {
@@ -386,7 +458,24 @@ export function auditOggOpus(input: Uint8Array): AuditResult {
 
     if (serial === null) {
       serial = page.serial;
+      if (chained) {
+        if (seenSerials.has(page.serial)) {
+          fail(
+            "SERIAL_NUMBER_REUSED",
+            index,
+            "link reuses a stream serial number from an earlier link",
+          );
+        }
+        seenSerials.add(page.serial);
+      }
     } else if (page.serial !== serial) {
+      if (chained) {
+        fail(
+          "STREAM_INTERLEAVED",
+          index,
+          "page serial does not match the open link; links must not interleave",
+        );
+      }
       fail("SERIAL_NUMBER_MISMATCH", index, "all pages must share one logical stream serial");
     }
 
@@ -408,6 +497,17 @@ export function auditOggOpus(input: Uint8Array): AuditResult {
       const id = validateIdHeader(completed[0]!, index);
       channels = id.channels;
       preSkip = id.preSkip;
+      if (chained) {
+        if (chainChannels === null) {
+          chainChannels = channels;
+        } else if (channels !== chainChannels) {
+          fail(
+            "CHANNEL_CONFIG_MISMATCH",
+            index,
+            "link OpusHead channel count differs from the first link",
+          );
+        }
+      }
       phase = "tags";
     } else if (phase === "tags") {
       if (eosFlag) {
@@ -552,33 +652,60 @@ export function auditOggOpus(input: Uint8Array): AuditResult {
     }
     openChunks = nextOpenChunks;
     previousEndedOpen = endsOpen;
+    linkPageCount += 1;
+
+    if (eosFlag) {
+      // Fold the completed link into the chain totals. The playable
+      // span of one link is its final granule minus its own pre-skip,
+      // clamped at zero.
+      totalPlayableSamples += Math.max(0, (lastAudioGranule ?? 0) - preSkip);
+      totalDecodedSamples += decodedSamples;
+      totalAudioPackets += audioPacketCount;
+      linkCount += 1;
+      if (chained) {
+        // The next page (if any) must open a fresh logical stream.
+        phase = "id";
+        serial = null;
+        expectedSequence = 0;
+        sawEos = false;
+        channels = 0;
+        preSkip = 0;
+        openChunks = null;
+        previousEndedOpen = false;
+        decodedSamples = 0;
+        audioPacketCount = 0;
+        lastAudioGranule = null;
+        linkPageCount = 0;
+      }
+    }
   }
 
-  if (phase !== "audio") {
-    fail("STREAM_NOT_TERMINATED", pageCount - 1, "both OpusHead and OpusTags are required");
+  if (linkPageCount > 0) {
+    // The file ended inside an unfinished link.
+    if (phase !== "audio") {
+      fail("STREAM_NOT_TERMINATED", pageCount - 1, "both OpusHead and OpusTags are required");
+    }
+    if (previousEndedOpen) {
+      fail(
+        "AUDIO_PACKET_TRUNCATED",
+        pageCount - 1,
+        "last page leaves an audio packet without a closing lacing value",
+      );
+    }
+    if (!sawEos) {
+      fail(
+        "STREAM_NOT_TERMINATED",
+        pageCount - 1,
+        "logical stream has no end-of-stream page; record may be truncated",
+      );
+    }
   }
-  if (previousEndedOpen) {
-    fail(
-      "AUDIO_PACKET_TRUNCATED",
-      pageCount - 1,
-      "last page leaves an audio packet without a closing lacing value",
-    );
-  }
-  if (!sawEos) {
-    fail(
-      "STREAM_NOT_TERMINATED",
-      pageCount - 1,
-      "logical stream has no end-of-stream page; record may be truncated",
-    );
-  }
-
-  const finalGranule = lastAudioGranule ?? 0;
-  const playableSamples = Math.max(0, finalGranule - preSkip);
 
   return {
     pageCount,
-    audioPacketCount,
-    decodedSamples,
-    playableSamples,
+    audioPacketCount: totalAudioPackets,
+    decodedSamples: totalDecodedSamples,
+    playableSamples: totalPlayableSamples,
+    linkCount,
   };
 }

@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { auditOggOpus, AuditError, MAX_BODY_BYTES, MAX_PAGES } from "./audit.js";
+import { auditOggOpus, auditOggOpusChain, AuditError, MAX_BODY_BYTES, MAX_PAGES, } from "./audit.js";
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 function sendJson(res, status, body) {
     if (res.writableEnded || res.destroyed) {
@@ -73,10 +73,27 @@ export function createAuditServer(options = {}) {
             });
             return;
         }
+        // Optional audit mode: `?logical_streams=chained` audits the body as
+        // a chain of complete logical streams; omitting it keeps the
+        // single-stream contract.
+        const queryStart = url.indexOf("?");
+        const logicalStreams = queryStart === -1
+            ? null
+            : new URLSearchParams(url.slice(queryStart + 1)).get("logical_streams");
+        if (logicalStreams !== null && logicalStreams !== "chained") {
+            sendJson(res, 400, {
+                error: {
+                    code: "UNSUPPORTED_LOGICAL_STREAMS",
+                    message: 'logical_streams must be "chained" when present',
+                },
+            });
+            return;
+        }
+        const chained = logicalStreams === "chained";
         readBody(req, maxBytes)
             .then((body) => {
             try {
-                const result = auditOggOpus(body);
+                const result = chained ? auditOggOpusChain(body) : auditOggOpus(body);
                 sendJson(res, 200, result);
             }
             catch (err) {

@@ -1,13 +1,16 @@
 /**
  * HTTP smoke test run once by the `verify` Compose service after the
  * API is healthy. It exercises the real server over HTTP, including an
- * audio packet split across Ogg pages and every documented failure
- * class, then exits non-zero if anything does not behave.
+ * audio packet split across Ogg pages, every documented failure class,
+ * and the chained-logical-stream audit mode (single-link compatibility
+ * plus a two-link chain with different pre-skips), then exits non-zero
+ * if anything does not behave.
  */
 
 import {
   buildRawPage,
   FLAG_EOS,
+  lacePackets,
   OggFileBuilder,
   opusPacket,
 } from "../test/helpers/oggBuilder.ts";
@@ -27,11 +30,11 @@ function check(name: string, condition: boolean, detail = ""): void {
   }
 }
 
-async function postAudit(body: Uint8Array, contentType = "audio/ogg"): Promise<{
+async function postAudit(body: Uint8Array, contentType = "audio/ogg", query = ""): Promise<{
   status: number;
   json: any;
 }> {
-  const res = await fetch(`${BASE_URL}/api/opus/audit`, {
+  const res = await fetch(`${BASE_URL}/api/opus/audit${query}`, {
     method: "POST",
     headers: { "content-type": contentType },
     body,
@@ -100,6 +103,40 @@ function unclosedPacketStream(): Uint8Array {
   const out = new Uint8Array(head.length + openEosPage.length);
   out.set(head, 0);
   out.set(openEosPage, head.length);
+  return out;
+}
+
+/** One complete chain link: config-31 packets of 960 samples each. */
+function chainLink(options: {
+  serial: number;
+  preSkip?: number;
+  packetCount?: number;
+  channels?: 1 | 2;
+  eos?: boolean;
+}): Uint8Array {
+  const channels = options.channels ?? 1;
+  const packets = Array.from({ length: options.packetCount ?? 1 }, () =>
+    opusPacket({ config: 31, stereo: channels === 2, frameData: [new Uint8Array([0x21])] }),
+  );
+  const builder = new OggFileBuilder({
+    preSkip: options.preSkip ?? 0,
+    channels,
+    serial: options.serial,
+  }).writeHeaders();
+  return builder
+    .writeAudioPackets(packets, options.eos === undefined ? {} : { eos: options.eos })
+    .build();
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.length;
+  }
   return out;
 }
 
@@ -218,6 +255,116 @@ async function main(): Promise<void> {
   console.log("6. transport-level rejection");
   const wrongType = await postAudit(good, "application/octet-stream");
   check("non audio/ogg payload is 415", wrongType.status === 415, `status=${wrongType.status}`);
+
+  console.log("7. chained mode: single-link compatibility");
+  const singleViaChain = await postAudit(good, "audio/ogg", "?logical_streams=chained");
+  check("returns 200", singleViaChain.status === 200, `status=${singleViaChain.status}`);
+  check("linkCount is 1", singleViaChain.json?.linkCount === 1, JSON.stringify(singleViaChain.json));
+  check(
+    "statistics match the single-stream audit",
+    singleViaChain.json?.pageCount === r1.json?.pageCount &&
+      singleViaChain.json?.audioPacketCount === r1.json?.audioPacketCount &&
+      singleViaChain.json?.decodedSamples === r1.json?.decodedSamples &&
+      singleViaChain.json?.playableSamples === r1.json?.playableSamples,
+    JSON.stringify(singleViaChain.json),
+  );
+
+  console.log("8. chained mode: two links with different pre-skips");
+  // Link A: pre-skip 312, 4 x 960 samples -> playable 3528.
+  // Link B: pre-skip 96, 2 x 960 samples -> playable 1824.
+  const chain = concatBytes([
+    chainLink({ serial: 0xa001, preSkip: 312, packetCount: 4 }),
+    chainLink({ serial: 0xb002, preSkip: 96, packetCount: 2 }),
+  ]);
+  const r8 = await postAudit(chain, "audio/ogg", "?logical_streams=chained");
+  check("returns 200", r8.status === 200, `status=${r8.status} ${JSON.stringify(r8.json)}`);
+  check("linkCount is 2", r8.json?.linkCount === 2, JSON.stringify(r8.json));
+  check("page count sums both links", r8.json?.pageCount === 6, JSON.stringify(r8.json));
+  check("audio packets sum both links", r8.json?.audioPacketCount === 6, JSON.stringify(r8.json));
+  check(
+    "decoded samples sum both links",
+    r8.json?.decodedSamples === 5760,
+    JSON.stringify(r8.json),
+  );
+  check(
+    "playable samples sum per-link granule minus pre-skip",
+    r8.json?.playableSamples === 3528 + 1824,
+    JSON.stringify(r8.json),
+  );
+  const r8repeat = await postAudit(chain, "audio/ogg", "?logical_streams=chained");
+  check(
+    "repeat audit of the chain is identical",
+    JSON.stringify(r8repeat.json) === JSON.stringify(r8.json),
+  );
+  const chainNoParam = await postAudit(chain);
+  check(
+    "omitting the parameter keeps single-stream semantics (422 BOS_FLAG_INVALID)",
+    chainNoParam.status === 422 && chainNoParam.json?.error?.code === "BOS_FLAG_INVALID",
+    `status=${chainNoParam.status} ${JSON.stringify(chainNoParam.json)}`,
+  );
+
+  console.log("9. chained mode rejects structural violations");
+  const dupSerial = await postAudit(
+    concatBytes([chainLink({ serial: 0xc003 }), chainLink({ serial: 0xc003 })]),
+    "audio/ogg",
+    "?logical_streams=chained",
+  );
+  check(
+    "duplicate serial is 422 SERIAL_NUMBER_REUSED at page 3",
+    dupSerial.status === 422 &&
+      dupSerial.json?.error?.code === "SERIAL_NUMBER_REUSED" &&
+      dupSerial.json?.error?.page === 3,
+    JSON.stringify(dupSerial.json),
+  );
+  const missingEos = await postAudit(
+    concatBytes([
+      chainLink({ serial: 0xd004, eos: false }),
+      chainLink({ serial: 0xe005 }),
+    ]),
+    "audio/ogg",
+    "?logical_streams=chained",
+  );
+  check(
+    "missing EOS before the next link is 422 STREAM_NOT_TERMINATED at page 3",
+    missingEos.status === 422 &&
+      missingEos.json?.error?.code === "STREAM_NOT_TERMINATED" &&
+      missingEos.json?.error?.page === 3,
+    JSON.stringify(missingEos.json),
+  );
+  const strayPage = buildRawPage({
+    serial: 0x1234,
+    sequence: 3, // continues the open link's page sequence
+    flags: 0,
+    granule: 1920n,
+    ...(() => {
+      const lacing = lacePackets([opusPacket({ config: 31, frameData: [new Uint8Array([1])] })]);
+      return { segments: Uint8Array.from(lacing.segments), body: lacing.body };
+    })(),
+  });
+  const interleaved = await postAudit(
+    concatBytes([chainLink({ serial: 0xf006, eos: false }), strayPage]),
+    "audio/ogg",
+    "?logical_streams=chained",
+  );
+  check(
+    "interleaved foreign page is 422 STREAM_INTERLEAVED at page 3",
+    interleaved.status === 422 &&
+      interleaved.json?.error?.code === "STREAM_INTERLEAVED" &&
+      interleaved.json?.error?.page === 3,
+    JSON.stringify(interleaved.json),
+  );
+  const channelChange = await postAudit(
+    concatBytes([chainLink({ serial: 0xaa08 }), chainLink({ serial: 0xab09, channels: 2 })]),
+    "audio/ogg",
+    "?logical_streams=chained",
+  );
+  check(
+    "channel change across links is 422 CHANNEL_CONFIG_MISMATCH at page 3",
+    channelChange.status === 422 &&
+      channelChange.json?.error?.code === "CHANNEL_CONFIG_MISMATCH" &&
+      channelChange.json?.error?.page === 3,
+    JSON.stringify(channelChange.json),
+  );
 
   console.log(`\n${checks} checks, ${failures} failures`);
   if (failures > 0) {
