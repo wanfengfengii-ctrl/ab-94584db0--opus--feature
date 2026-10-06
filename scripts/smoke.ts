@@ -7,6 +7,7 @@
 
 import {
   buildRawPage,
+  DEFAULT_SERIAL,
   FLAG_EOS,
   OggFileBuilder,
   opusPacket,
@@ -27,11 +28,15 @@ function check(name: string, condition: boolean, detail = ""): void {
   }
 }
 
-async function postAudit(body: Uint8Array, contentType = "audio/ogg"): Promise<{
+async function postAudit(
+  body: Uint8Array,
+  contentType = "audio/ogg",
+  query = "",
+): Promise<{
   status: number;
   json: any;
 }> {
-  const res = await fetch(`${BASE_URL}/api/opus/audit`, {
+  const res = await fetch(`${BASE_URL}/api/opus/audit${query}`, {
     method: "POST",
     headers: { "content-type": contentType },
     body,
@@ -57,6 +62,29 @@ async function waitForHealth(): Promise<void> {
     await new Promise((r) => setTimeout(r, 500));
   }
   throw new Error(`api never became healthy: ${lastError}`);
+}
+
+/** Build one complete chained link with its own serial and pre-skip. */
+function chainLink(serial: number, preSkip: number, packetCount: number): Uint8Array {
+  const packets = Array.from({ length: packetCount }, () =>
+    opusPacket({ config: 31, frameData: [new Uint8Array([0x31])] }),
+  );
+  return new OggFileBuilder({ preSkip, serial })
+    .writeHeaders()
+    .writeAudioPackets(packets)
+    .build();
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.length;
+  }
+  return out;
 }
 
 function validSpanningStream(): Uint8Array {
@@ -218,6 +246,56 @@ async function main(): Promise<void> {
   console.log("6. transport-level rejection");
   const wrongType = await postAudit(good, "application/octet-stream");
   check("non audio/ogg payload is 415", wrongType.status === 415, `status=${wrongType.status}`);
+
+  console.log("7. chained mode accepts a single link unchanged");
+  const singleLink = await postAudit(good, "audio/ogg", "?logical_streams=chained");
+  check("returns 200", singleLink.status === 200, `status=${singleLink.status} ${JSON.stringify(singleLink.json)}`);
+  check("linkCount is 1", singleLink.json?.linkCount === 1, JSON.stringify(singleLink.json));
+  check(
+    "single-link statistics match the plain response",
+    singleLink.json?.pageCount === r1.json?.pageCount &&
+      singleLink.json?.audioPacketCount === r1.json?.audioPacketCount &&
+      singleLink.json?.decodedSamples === r1.json?.decodedSamples &&
+      singleLink.json?.playableSamples === r1.json?.playableSamples,
+    JSON.stringify(singleLink.json),
+  );
+
+  console.log("8. chained mode audits two links with different pre-skips");
+  // Link A: pre-skip 312, four 20 ms packets -> playable 3840-312.
+  // Link B: pre-skip 120, two 20 ms packets -> playable 1920-120.
+  // A fresh BOS restarts sequence numbers at zero; serials differ.
+  const linkA = chainLink(DEFAULT_SERIAL, 312, 4);
+  const linkB = chainLink(DEFAULT_SERIAL + 1, 120, 2);
+  const chained = concatBytes([linkA, linkB]);
+  const r8 = await postAudit(chained, "audio/ogg", "?logical_streams=chained");
+  check("returns 200", r8.status === 200, `status=${r8.status} ${JSON.stringify(r8.json)}`);
+  check("linkCount is 2", r8.json?.linkCount === 2, JSON.stringify(r8.json));
+  check("global page count is 6", r8.json?.pageCount === 6, JSON.stringify(r8.json));
+  check("global audio packet count is 6", r8.json?.audioPacketCount === 6, JSON.stringify(r8.json));
+  check("decoded samples total 5760", r8.json?.decodedSamples === 5760, JSON.stringify(r8.json));
+  check(
+    "playable samples sum per-link (3840-312)+(1920-120)",
+    r8.json?.playableSamples === (3840 - 312) + (1920 - 120),
+    JSON.stringify(r8.json),
+  );
+  const r8b = await postAudit(chained, "audio/ogg", "?logical_streams=chained");
+  check("repeated chained audit is identical", JSON.stringify(r8b.json) === JSON.stringify(r8.json));
+
+  console.log("9. chained mode rejects a link missing its EOS");
+  const unterminated = new OggFileBuilder({ preSkip: 0, serial: DEFAULT_SERIAL })
+    .writeHeaders()
+    .writeAudioPackets([opusPacket({ config: 31, frameData: [new Uint8Array([1])] })], {
+      eos: false,
+    })
+    .build();
+  const r9 = await postAudit(concatBytes([unterminated, linkB]), "audio/ogg", "?logical_streams=chained");
+  check("returns 422", r9.status === 422, `status=${r9.status}`);
+  check(
+    "stable error code STREAM_NOT_TERMINATED",
+    r9.json?.error?.code === "STREAM_NOT_TERMINATED",
+    JSON.stringify(r9.json),
+  );
+  check("failure page is the next BOS at global index 3", r9.json?.error?.page === 3, JSON.stringify(r9.json));
 
   console.log(`\n${checks} checks, ${failures} failures`);
   if (failures > 0) {

@@ -1,6 +1,5 @@
 /**
- * Structural audit of a single-logical-stream Ogg Opus file
- * (RFC 3533 + RFC 7845 + RFC 6716).
+ * Structural audit of Ogg Opus files (RFC 3533 + RFC 7845 + RFC 6716).
  *
  * The auditor is deliberately stricter than a tolerant player: it never
  * re-synchronises after a bad capture pattern, checks every page CRC,
@@ -8,11 +7,22 @@
  * Ogg packet across page boundaries, validates each Opus packet's TOC
  * framing, and proves that the granule-position timeline matches the
  * 48 kHz sample counts derived from the TOC bytes.
+ *
+ * In the default mode exactly one complete logical stream is accepted,
+ * exactly as before. With `chained: true` the file may sequentially
+ * concatenate 1..MAX_LINKS complete links (an encoder restart flushes a
+ * fresh BOS with its own serial and page-sequence counter): every link
+ * starts at BOS with sequence 0, the next link may begin only after a
+ * complete EOS, links must not interleave or share packet state,
+ * serials are pairwise distinct, and every OpusHead must declare the
+ * channel count of the first link. Byte/page budgets and the reported
+ * aggregates always span the whole file.
  */
 import { oggCrc32 } from "./crc32ogg.js";
 import { inspectOpusPacket, OpusFormatError } from "./opusToc.js";
 export const MAX_BODY_BYTES = 8 * 1024 * 1024;
 export const MAX_PAGES = 2048;
+export const MAX_LINKS = 16;
 const OGG_MAGIC = [0x4f, 0x67, 0x67, 0x53]; // "OggS"
 const OPUS_HEAD_MAGIC = 0x4f70757348656164n; // "OpusHead", big-endian bytes
 const OPUS_TAGS_MAGIC = "OpusTags";
@@ -217,7 +227,8 @@ function walkPageSegments(page, carriedChunks) {
     }
     return { completed, openChunks: chunks };
 }
-export function auditOggOpus(input) {
+export function auditOggOpus(input, options = {}) {
+    const chained = options.chained ?? false;
     if (input.length === 0) {
         fail("EMPTY_INPUT", null, "request body is empty", 400);
     }
@@ -226,12 +237,21 @@ export function auditOggOpus(input) {
     }
     let offset = 0;
     let pageCount = 0;
+    let linkCount = 0;
+    // Aggregates span the whole file, every complete link contributing.
+    let totalAudioPackets = 0;
+    let totalDecodedSamples = 0;
+    let totalPlayableSamples = 0;
+    const seenSerials = new Set();
+    let referenceChannels = null;
+    // Per-link state, reset whenever a BOS page opens a new link.
     let phase = "id";
     let serial = null;
     let expectedSequence = 0;
-    let sawEos = false;
+    let linkSawEos = false;
     let channels = 0;
     let preSkip = 0;
+    let pendingNewLink = true;
     let openChunks = null;
     let previousEndedOpen = false;
     let decodedSamples = 0;
@@ -240,7 +260,7 @@ export function auditOggOpus(input) {
     while (offset < input.length) {
         const index = pageCount;
         if (index >= MAX_PAGES) {
-            fail("TOO_MANY_PAGES", index, "stream exceeds 2048 pages");
+            fail("TOO_MANY_PAGES", index, "file exceeds 2048 pages");
         }
         const page = parsePage(input, offset, index);
         pageCount += 1;
@@ -248,19 +268,60 @@ export function auditOggOpus(input) {
         const eosFlag = (page.headerType & FLAG_EOS) !== 0;
         const continuedFlag = (page.headerType & FLAG_CONTINUED) !== 0;
         const bosFlag = (page.headerType & FLAG_BOS) !== 0;
-        /* ---- stream-level flag / sequencing checks ---- */
-        if (index === 0) {
+        /* ---- link boundaries / stream-level sequencing ---- */
+        if (pendingNewLink) {
+            // Opening page of a link. In single-stream mode a second BOS can
+            // only be a page after EOS, which keeps the original rejection.
+            if (linkCount >= 1 && !chained) {
+                fail("EOS_FLAG_INVALID", index, "page present after end-of-stream");
+            }
             if (!bosFlag || continuedFlag) {
-                fail("BOS_FLAG_INVALID", index, "first page must be BOS without continuation");
+                fail("BOS_FLAG_INVALID", index, linkCount === 0
+                    ? "first page must be BOS without continuation"
+                    : "each chained link must begin with a BOS page without continuation");
             }
             if (eosFlag) {
                 fail("EOS_FLAG_INVALID", index, "BOS page cannot also be EOS");
             }
             if (page.sequence !== 0) {
-                fail("PAGE_SEQUENCE_INVALID", index, "first page sequence number must be 0");
+                fail("PAGE_SEQUENCE_INVALID", index, linkCount === 0
+                    ? "first page sequence number must be 0"
+                    : "each chained link must restart its page sequence at 0");
             }
+            linkCount += 1;
+            if (linkCount > MAX_LINKS) {
+                fail("TOO_MANY_LINKS", index, `chained file holds more than ${MAX_LINKS} logical streams`);
+            }
+            if (seenSerials.has(page.serial)) {
+                fail("SERIAL_NUMBER_REUSED", index, "chained links must use pairwise distinct stream serial numbers");
+            }
+            seenSerials.add(page.serial);
+            // Reset all per-link state; no packet may carry across links.
+            phase = "id";
+            serial = page.serial;
+            expectedSequence = 1;
+            linkSawEos = false;
+            channels = 0;
+            preSkip = 0;
+            openChunks = null;
+            previousEndedOpen = false;
+            decodedSamples = 0;
+            audioPacketCount = 0;
+            lastAudioGranule = null;
+            pendingNewLink = false;
         }
         else {
+            if (chained && bosFlag) {
+                if (previousEndedOpen) {
+                    // A packet is still open when the next BOS arrives: links may
+                    // not interleave or continue a packet across the boundary.
+                    fail("LINK_INTERLEAVED", index, "a packet of the previous link is still open when the next BOS begins");
+                }
+                // Previous page closed every packet but the link never carried
+                // EOS: whether the BOS reuses the serial or starts a new one,
+                // the preceding link is missing its end-of-stream.
+                fail("STREAM_NOT_TERMINATED", index, "new BOS page starts before the previous chained link reached EOS");
+            }
             if (bosFlag) {
                 fail("BOS_FLAG_INVALID", index, "BOS flag set after the first page");
             }
@@ -272,16 +333,16 @@ export function auditOggOpus(input) {
                     ? "packet continues from previous page but continuation flag is unset"
                     : "continuation flag set without an open packet on the previous page");
             }
-            if (sawEos) {
+            if (linkSawEos) {
                 fail("EOS_FLAG_INVALID", index, "page present after end-of-stream");
             }
-        }
-        expectedSequence = (page.sequence + 1) >>> 0;
-        if (serial === null) {
-            serial = page.serial;
-        }
-        else if (page.serial !== serial) {
-            fail("SERIAL_NUMBER_MISMATCH", index, "all pages must share one logical stream serial");
+            if (page.serial !== serial) {
+                if (chained) {
+                    fail("LINK_INTERLEAVED", index, "pages of another logical stream appear before the current link reached EOS");
+                }
+                fail("SERIAL_NUMBER_MISMATCH", index, "all pages must share one logical stream serial");
+            }
+            expectedSequence = (page.sequence + 1) >>> 0;
         }
         /* ---- lacing / packet reconstruction ---- */
         const { completed, openChunks: nextOpenChunks } = walkPageSegments(page, continuedFlag ? openChunks : null);
@@ -294,6 +355,12 @@ export function auditOggOpus(input) {
                 fail("HEADER_GRANULE_INVALID", index, "ID header page granule must be zero");
             }
             const id = validateIdHeader(completed[0], index);
+            if (referenceChannels === null) {
+                referenceChannels = id.channels;
+            }
+            else if (id.channels !== referenceChannels) {
+                fail("CHANNEL_CONFIG_MISMATCH", index, "OpusHead channel count does not match the first link of the chained file");
+            }
             channels = id.channels;
             preSkip = id.preSkip;
             phase = "tags";
@@ -405,27 +472,46 @@ export function auditOggOpus(input) {
                 fail("AUDIO_PACKET_TRUNCATED", index, "EOS page ends with an unclosed audio packet");
             }
         }
-        if (eosFlag) {
-            sawEos = true;
-        }
         openChunks = nextOpenChunks;
         previousEndedOpen = endsOpen;
+        if (eosFlag) {
+            linkSawEos = true;
+            // Fold the finished link into the whole-file aggregates. Its
+            // playable duration is the link's own final granule minus its own
+            // pre-skip; each link timeline restarts at zero.
+            totalAudioPackets += audioPacketCount;
+            totalDecodedSamples += decodedSamples;
+            totalPlayableSamples += Math.max(0, (lastAudioGranule ?? 0) - preSkip);
+            if (chained) {
+                pendingNewLink = true;
+            }
+        }
     }
-    if (phase !== "audio") {
-        fail("STREAM_NOT_TERMINATED", pageCount - 1, "both OpusHead and OpusTags are required");
+    if (!pendingNewLink) {
+        // The file ended inside the last link.
+        if (phase !== "audio") {
+            fail("STREAM_NOT_TERMINATED", pageCount - 1, "both OpusHead and OpusTags are required");
+        }
+        if (previousEndedOpen) {
+            fail("AUDIO_PACKET_TRUNCATED", pageCount - 1, "last page leaves an audio packet without a closing lacing value");
+        }
+        if (!linkSawEos) {
+            fail("STREAM_NOT_TERMINATED", pageCount - 1, "logical stream has no end-of-stream page; record may be truncated");
+        }
     }
-    if (previousEndedOpen) {
-        fail("AUDIO_PACKET_TRUNCATED", pageCount - 1, "last page leaves an audio packet without a closing lacing value");
+    if (chained) {
+        return {
+            pageCount,
+            audioPacketCount: totalAudioPackets,
+            decodedSamples: totalDecodedSamples,
+            playableSamples: totalPlayableSamples,
+            linkCount,
+        };
     }
-    if (!sawEos) {
-        fail("STREAM_NOT_TERMINATED", pageCount - 1, "logical stream has no end-of-stream page; record may be truncated");
-    }
-    const finalGranule = lastAudioGranule ?? 0;
-    const playableSamples = Math.max(0, finalGranule - preSkip);
     return {
         pageCount,
-        audioPacketCount,
-        decodedSamples,
-        playableSamples,
+        audioPacketCount: totalAudioPackets,
+        decodedSamples: totalDecodedSamples,
+        playableSamples: totalPlayableSamples,
     };
 }

@@ -2,10 +2,33 @@
 
 海洋声学站归档 Ogg Opus 记录的**分页完整性审计服务**。播放器对损坏的
 Ogg/Opus 流相当宽容，可能掩盖页截断、跨页丢包或时长漂移；本服务在归档前
-对单一逻辑流做严格的结构校验，绝不做"容错式"重同步。
+对逻辑流做严格的结构校验，绝不做"容错式"重同步。
 
 - `POST /api/opus/audit`（`Content-Type: audio/ogg`，体积 ≤ 8 MiB，页数 ≤ 2048）
+- 可选查询参数 `logical_streams=chained`：审计由编码器重启顺序拼接的
+  **1–16 段完整逻辑流（chained Ogg）**；省略时保持单流原契约
 - `GET /health` 健康检查
+
+## 链式逻辑流（`logical_streams=chained`）
+
+水声记录器重启编码器后，可能把多段完整 Ogg Opus 逻辑流顺序写进同一个文件。
+启用链式审计后，平台对整份文件一次性全链审计，而不会把后续 BOS 当作尾随数据：
+
+- 每段必须从 **BOS 页**开始、**页序号从 0 重新计数**；前一段完整 EOS 之后，
+  下一段才允许开始；
+- 各段**流序列号两两不同**，段间不得交错（未到 EOS 出现其它序列号的页），
+  也不得跨段续包；
+- 所有 `OpusHead` 的声道数必须与**首段一致**（pre-skip、输出增益等可不同）；
+- 包成帧、CRC、粒度时间线等规则**对每段独立成立**（每段粒度从 0 重新累计）；
+- **8 MiB 与 2048 页限制按整份文件计算**；
+- 成功响应增加 `linkCount`，`pageCount` / `audioPacketCount` /
+  `decodedSamples` 为全链汇总；`playableSamples` 为各段
+  `max(0, 该段末粒度 − 该段 pre-skip)` 之和。
+
+段间交错、缺失 EOS、重复流序列号、声道变化等均返回 422，并给出**首个全局
+失败页索引**与稳定错误码（如 `LINK_INTERLEAVED`、`SERIAL_NUMBER_REUSED`、
+`STREAM_NOT_TERMINATED`、`CHANNEL_CONFIG_MISMATCH`、`TOO_MANY_LINKS`）。
+省略参数时，含多段 BOS 的文件仍按原单流契约拒绝。
 
 ## 审计内容
 
@@ -29,7 +52,7 @@ Ogg/Opus 流相当宽容，可能掩盖页截断、跨页丢包或时长漂移�
 
 ## 返回
 
-成功（200）：
+成功（200，单流契约）：
 
 ```json
 {
@@ -40,9 +63,21 @@ Ogg/Opus 流相当宽容，可能掩盖页截断、跨页丢包或时长漂移�
 }
 ```
 
+链式模式额外返回 `linkCount`，各字段为全链汇总：
+
+```json
+{
+  "pageCount": 6,
+  "audioPacketCount": 6,
+  "decodedSamples": 5760,
+  "playableSamples": 5328,
+  "linkCount": 2
+}
+```
+
 - `decodedSamples`：所有完整音频包按 TOC 累计的 48 kHz 解码样本数；
-- `playableSamples`：最终 EOS 粒度减去 OpusHead pre-skip（钳为非负），
-  即真实可播放样本数。
+- `playableSamples`：单流为最终 EOS 粒度减去 OpusHead pre-skip（钳为非负）；
+  链式模式下各段独立计算后求和，即真实可播放样本数。
 
 失败返回 422（体积超限 413、空体 400、类型不符 415），并给出稳定错误码与
 **首个失败页索引**：
@@ -55,7 +90,7 @@ Ogg/Opus 流相当宽容，可能掩盖页截断、跨页丢包或时长漂移�
 
 ```bash
 npm ci
-npm test          # 76 个单元/HTTP 测试
+npm test          # 97 个单元/HTTP 测试
 npm run build     # tsc -> dist/
 npm start         # 默认 0.0.0.0:3000
 ```

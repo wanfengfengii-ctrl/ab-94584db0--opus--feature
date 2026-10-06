@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import type { Server } from "node:http";
 import { createAuditServer } from "../src/server.ts";
 import { OggFileBuilder, opusPacket } from "./helpers/oggBuilder.ts";
-
 let server: Server;
 let baseUrl: string;
 
@@ -28,6 +27,25 @@ function validStream(): Uint8Array {
     opusPacket({ config: 31, frameData: [new Uint8Array([0x11])] }),
   );
   return new OggFileBuilder({ preSkip: 0 }).writeHeaders().writeAudioPackets(packets).build();
+}
+
+function chainStream(): Uint8Array {
+  // Two complete links with different serials and pre-skips.
+  const mk = (serial: number, preSkip: number, count: number): Uint8Array => {
+    const packets = Array.from({ length: count }, () =>
+      opusPacket({ config: 31, frameData: [new Uint8Array([0x11])] }),
+    );
+    return new OggFileBuilder({ preSkip, serial })
+      .writeHeaders()
+      .writeAudioPackets(packets)
+      .build();
+  };
+  const a = mk(0x4f50_5553, 312, 4);
+  const b = mk(0x4f50_5554, 120, 2);
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
 }
 
 interface ErrorBody {
@@ -108,6 +126,55 @@ test("a corrupted stream yields 422 with code and failing page", async () => {
   assert.equal(body.error.code, "BAD_CRC");
   assert.equal(body.error.page, 2);
   assert.equal(typeof body.error.message, "string");
+});
+
+test("chained query parameter is accepted and aggregates links", async () => {
+  const res = await fetch(`${baseUrl}/api/opus/audit?logical_streams=chained`, {
+    method: "POST",
+    headers: { "content-type": "audio/ogg" },
+    body: chainStream(),
+  });
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), {
+    pageCount: 6,
+    audioPacketCount: 6,
+    decodedSamples: 5760,
+    playableSamples: (4 * 960 - 312) + (2 * 960 - 120),
+    linkCount: 2,
+  });
+});
+
+test("chained mode stays optional: omitted parameter keeps the old shape", async () => {
+  const res = await fetch(`${baseUrl}/api/opus/audit`, {
+    method: "POST",
+    headers: { "content-type": "audio/ogg" },
+    body: validStream(),
+  });
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as Record<string, unknown>;
+  assert.equal("linkCount" in body, false);
+});
+
+test("a chained file without the parameter is still rejected", async () => {
+  const res = await fetch(`${baseUrl}/api/opus/audit`, {
+    method: "POST",
+    headers: { "content-type": "audio/ogg" },
+    body: chainStream(),
+  });
+  assert.equal(res.status, 422);
+  const body = await readErrorBody(res);
+  assert.equal(body.error.code, "BOS_FLAG_INVALID");
+  assert.equal(body.error.page, 3);
+});
+
+test("an invalid logical_streams value yields 400", async () => {
+  const res = await fetch(`${baseUrl}/api/opus/audit?logical_streams=parallel`, {
+    method: "POST",
+    headers: { "content-type": "audio/ogg" },
+    body: validStream(),
+  });
+  assert.equal(res.status, 400);
+  assert.equal((await readErrorBody(res)).error.code, "INVALID_QUERY_PARAMETER");
 });
 
 test("body beyond the configured byte cap yields 413", async () => {

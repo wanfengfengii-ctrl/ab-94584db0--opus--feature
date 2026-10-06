@@ -628,6 +628,254 @@ test("more than 2048 pages fails", () => {
   expectFail(builder.build(), "TOO_MANY_PAGES", 2048);
 });
 
+/* ------------------------ chained logical streams ----------------------- */
+
+const SERIAL_A = 0x4f50_5553; // "OPUS"
+const SERIAL_B = 0x4f50_5554;
+const SERIAL_C = 0x4f50_5555;
+
+/** Build one complete link: headers plus one EOS page of packets. */
+function link(
+  serial: number,
+  packets: Uint8Array[],
+  options: { preSkip?: number; channels?: 1 | 2; finalPageTrim?: number } = {},
+): Uint8Array {
+  return new OggFileBuilder({
+    preSkip: options.preSkip ?? 0,
+    channels: options.channels ?? 1,
+    serial,
+  })
+    .writeHeaders()
+    .writeAudioPackets(packets, {
+      ...(options.finalPageTrim !== undefined ? { finalPageTrim: options.finalPageTrim } : {}),
+    })
+    .build();
+}
+
+function audio(count: number): Uint8Array[] {
+  return Array.from({ length: count }, () =>
+    opusPacket({ config: 31, frameData: [new Uint8Array([0x21])] }),
+  );
+}
+
+test("chained mode: single link equals single-stream statistics plus linkCount", () => {
+  const packets = audio(4);
+  const file = link(SERIAL_A, packets, { preSkip: 312 });
+  const chained = auditOggOpus(file, { chained: true });
+  const plain = auditOggOpus(file);
+  assert.equal(chained.linkCount, 1);
+  assert.equal(chained.pageCount, plain.pageCount);
+  assert.equal(chained.audioPacketCount, plain.audioPacketCount);
+  assert.equal(chained.decodedSamples, plain.decodedSamples);
+  assert.equal(chained.playableSamples, plain.playableSamples);
+  assert.equal(chained.playableSamples, 4 * 960 - 312);
+});
+
+test("chained mode: two links with different pre-skips aggregate independently", () => {
+  const a = link(SERIAL_A, audio(4), { preSkip: 312 });
+  const b = link(SERIAL_B, audio(2), { preSkip: 120 });
+  const file = concatBytes([a, b]);
+  const r1 = auditOggOpus(file, { chained: true });
+  assert.equal(r1.linkCount, 2);
+  assert.equal(r1.pageCount, 3 + 3);
+  assert.equal(r1.audioPacketCount, 6);
+  assert.equal(r1.decodedSamples, 6 * 960);
+  // Each link timeline restarts at zero and pays its own pre-skip.
+  assert.equal(r1.playableSamples, (4 * 960 - 312) + (2 * 960 - 120));
+
+  // Repeated audits of the same chained file are byte-stable.
+  const r2 = auditOggOpus(file, { chained: true });
+  assert.deepEqual(r1, r2);
+});
+
+test("chained mode: page sequence restarts at zero per link", () => {
+  const a = link(SERIAL_A, audio(1), { preSkip: 0 });
+  const b = link(SERIAL_B, audio(1), { preSkip: 0 });
+  const r = auditOggOpus(concatBytes([a, b]), { chained: true });
+  assert.equal(r.linkCount, 2);
+  assert.equal(r.pageCount, 6);
+});
+
+test("chained mode: stereo second link is allowed when matching the first", () => {
+  const stereoPackets = (count: number): Uint8Array[] =>
+    Array.from({ length: count }, () =>
+      opusPacket({ config: 31, stereo: true, frameData: [new Uint8Array([1])] }),
+    );
+  const a = link(SERIAL_A, stereoPackets(2), { channels: 2 });
+  const b = link(SERIAL_B, stereoPackets(1), { channels: 2 });
+  const r = auditOggOpus(concatBytes([a, b]), { chained: true });
+  assert.equal(r.linkCount, 2);
+  assert.equal(r.audioPacketCount, 3);
+});
+
+test("chained mode: channel count change between links fails on the new BOS page", () => {
+  const a = link(SERIAL_A, audio(2), { channels: 1 });
+  const b = link(SERIAL_B, audio(2), { channels: 2 });
+  // Second link BOS is global page 3.
+  expectChainedFail(concatBytes([a, b]), "CHANNEL_CONFIG_MISMATCH", 3);
+});
+
+test("chained mode: repeated serial number fails on the offending BOS page", () => {
+  const a = link(SERIAL_A, audio(1), { preSkip: 0 });
+  const b = link(SERIAL_A, audio(1), { preSkip: 0 });
+  expectChainedFail(concatBytes([a, b]), "SERIAL_NUMBER_REUSED", 3);
+});
+
+test("chained mode: link missing EOS before the next BOS fails", () => {
+  const a = new OggFileBuilder({ preSkip: 0, serial: SERIAL_A })
+    .writeHeaders()
+    .writeAudioPackets(audio(1), { eos: false })
+    .build();
+  const b = link(SERIAL_B, audio(1), { preSkip: 0 });
+  // The second BOS page arrives while the first link is open.
+  expectChainedFail(concatBytes([a, b]), "STREAM_NOT_TERMINATED", 3);
+});
+
+test("chained mode: interleaved page from a foreign serial fails", () => {
+  // Link A headers + one non-EOS audio page, then a page carrying B's
+  // serial but without BOS (A never reached EOS): classic interleaving.
+  const headA = new OggFileBuilder({ preSkip: 0, serial: SERIAL_A }).writeHeaders().build();
+  const aAudioLacing = pagePayload(audio(1));
+  const foreign = buildRawPage({
+    serial: SERIAL_B,
+    sequence: 2,
+    flags: 0,
+    granule: 960n,
+    segments: Uint8Array.from(aAudioLacing.segments),
+    body: aAudioLacing.body,
+  });
+  expectChainedFail(concatBytes([headA, foreign]), "LINK_INTERLEAVED", 2);
+});
+
+test("chained mode: continuation must not carry a packet across links", () => {
+  // Link A ends with a still-open packet and no EOS; the next page is a
+  // new BOS. A packet cannot straddle the boundary, which is reported as
+  // interleaving at the BOS page.
+  const big = opusPacket({
+    config: 28,
+    code: 3,
+    frameData: Array.from({ length: 6 }, () => new Uint8Array(120)),
+  });
+  const head = new OggFileBuilder({ serial: SERIAL_A }).writeHeaders().build();
+  const openPage = buildRawPage({
+    serial: SERIAL_A,
+    sequence: 2,
+    flags: 0,
+    granule: -1n,
+    segments: new Uint8Array([255, 255]),
+    body: big.subarray(0, 510),
+  });
+  const b = link(SERIAL_B, audio(1), { preSkip: 0 });
+  expectChainedFail(concatBytes([head, openPage, b]), "LINK_INTERLEAVED", 3);
+});
+
+test("chained mode: final link without EOS fails as truncated", () => {
+  const a = link(SERIAL_A, audio(1), { preSkip: 0 });
+  const b = new OggFileBuilder({ preSkip: 0, serial: SERIAL_B })
+    .writeHeaders()
+    .writeAudioPackets(audio(1), { eos: false })
+    .build();
+  expectChainedFail(concatBytes([a, b]), "STREAM_NOT_TERMINATED", 3 + 2);
+});
+
+test("chained mode: per-link packet/CRC/granule rules still apply", () => {
+  const a = link(SERIAL_A, audio(2), { preSkip: 0 });
+  const b = new OggFileBuilder({ preSkip: 0, serial: SERIAL_B })
+    .writeHeaders()
+    .writeAudioPackets(audio(2), { packetsPerPage: 2 })
+    .build();
+  // Corrupt a body byte on the last page of link B: the CRC failure
+  // must be reported at the global page index (A=3 pages, B last=5).
+  b[b.length - 2]! ^= 0xff;
+  expectChainedFail(concatBytes([a, b]), "BAD_CRC", 5);
+});
+
+test("chained mode: second link BOS sequence not restarted at zero fails", () => {
+  const a = link(SERIAL_A, audio(1), { preSkip: 0 }); // 3 pages
+  const bRaw = link(SERIAL_B, audio(1), { preSkip: 0 });
+  // Claim sequence 3 (continuing link A) on link B's BOS page.
+  bRaw[18] = 3;
+  fixCrcs(bRaw);
+  expectChainedFail(concatBytes([a, bRaw]), "PAGE_SEQUENCE_INVALID", 3);
+});
+
+test("chained mode: more than 16 links fails on the 17th BOS page", () => {
+  const parts: Uint8Array[] = [];
+  for (let i = 0; i < 17; i++) {
+    parts.push(link(SERIAL_A + i, audio(1), { preSkip: 0 }));
+  }
+  // Each link is 3 pages; 17th BOS sits at global index 16*3 = 48.
+  expectChainedFail(concatBytes(parts), "TOO_MANY_LINKS", 48);
+});
+
+test("chained mode: 8 MiB and 2048 page limits apply to the whole file", () => {
+  // Link A consumes 2046 pages (2 headers + 2044 non-EOS audio pages);
+  // link B's BOS at global index 2046 is fine, its tags at 2047 fine,
+  // and its first audio page at global index 2048 trips the global cap.
+  const builder = new OggFileBuilder({ preSkip: 0, serial: SERIAL_A }).writeHeaders();
+  builder.writeRawPages(
+    Array.from({ length: 2044 }, (_unused, i) => ({
+      flags: i === 2043 ? FLAG_EOS : 0,
+      granule: BigInt((i + 1) * 120),
+      ...pagePayload([opusPacket({ config: 28, frameData: [new Uint8Array([1])] })]),
+    })),
+  );
+  const a = builder.build();
+  assert.equal(countPages(a), 2046);
+  const b = link(SERIAL_B, audio(1), { preSkip: 0 }); // 3 more pages
+  expectChainedFail(concatBytes([a, b]), "TOO_MANY_PAGES", 2048);
+});
+
+function countPages(buf: Uint8Array): number {
+  let off = 0;
+  let count = 0;
+  while (off < buf.length) {
+    const nseg = buf[off + 26]!;
+    let bodyLen = 0;
+    for (let i = 0; i < nseg; i++) bodyLen += buf[off + 27 + i]!;
+    off += 27 + nseg + bodyLen;
+    count += 1;
+  }
+  return count;
+}
+
+test("chained mode: default mode keeps rejecting a chained file", () => {
+  const a = link(SERIAL_A, audio(1), { preSkip: 0 });
+  const b = link(SERIAL_B, audio(1), { preSkip: 0 });
+  // Without the opt-in a second BOS page after the first page is the
+  // original single-stream contract failure.
+  expectFail(concatBytes([a, b]), "BOS_FLAG_INVALID", 3);
+});
+
+test("chained mode: playable samples clamp per link and still sum", () => {
+  // Link B: two audio pages (960 each); the EOS granule trims the final
+  // page entirely (960), while its pre-skip is 1000, so its own
+  // playable contribution clamps to zero without invalidating the link.
+  const b = new OggFileBuilder({ preSkip: 1000, serial: SERIAL_B })
+    .writeHeaders()
+    .writeAudioPackets(audio(2), { packetsPerPage: 1 })
+    .build();
+  const off = pageOffset(b, 3);
+  writeGranule(b, off, 960n);
+  fixCrcs(b);
+  const a = link(SERIAL_A, audio(1), { preSkip: 100 }); // 960 - 100 = 860
+  const r = auditOggOpus(concatBytes([a, b]), { chained: true });
+  assert.equal(r.linkCount, 2);
+  assert.equal(r.playableSamples, 860 + 0);
+});
+
+function expectChainedFail(input: Uint8Array, code: string, page: number | null): void {
+  try {
+    auditOggOpus(input, { chained: true });
+    assert.fail("expected chained audit to fail");
+  } catch (err) {
+    assert.ok(err instanceof AuditError, `expected AuditError, got ${err}`);
+    assert.equal((err as AuditError).code, code);
+    assert.equal((err as AuditError).pageIndex, page);
+    assert.equal((err as AuditError).status, 422);
+  }
+}
+
 /* ------------------------------- helpers ------------------------------- */
 
 function pagePayload(packets: Uint8Array[]): { segments: number[]; body: Uint8Array } {

@@ -63,6 +63,23 @@ export function createAuditServer(options = {}) {
             sendJson(res, 404, { error: { code: "NOT_FOUND", message: "unknown route" } });
             return;
         }
+        // Optional opt-in for sequentially chained logical streams. The
+        // parameter is absent by default, which keeps the original
+        // single-logical-stream contract (including its response shape).
+        let chained = false;
+        {
+            const mode = new URL(url, "http://localhost").searchParams.get("logical_streams");
+            if (mode !== null && mode !== "chained") {
+                sendJson(res, 400, {
+                    error: {
+                        code: "INVALID_QUERY_PARAMETER",
+                        message: "logical_streams only accepts the value 'chained'",
+                    },
+                });
+                return;
+            }
+            chained = mode === "chained";
+        }
         const contentType = (req.headers["content-type"] ?? "").split(";")[0]?.trim().toLowerCase();
         if (contentType !== "audio/ogg") {
             sendJson(res, 415, {
@@ -76,7 +93,7 @@ export function createAuditServer(options = {}) {
         readBody(req, maxBytes)
             .then((body) => {
             try {
-                const result = auditOggOpus(body);
+                const result = auditOggOpus(body, { chained });
                 sendJson(res, 200, result);
             }
             catch (err) {

@@ -233,10 +233,12 @@ export class OggFileBuilder {
   private accumulated = 0;
   readonly preSkip: number;
   readonly channels: 1 | 2;
+  readonly serial: number;
 
-  constructor(options: { preSkip?: number; channels?: 1 | 2 } = {}) {
+  constructor(options: { preSkip?: number; channels?: 1 | 2; serial?: number } = {}) {
     this.preSkip = options.preSkip ?? 312;
     this.channels = options.channels ?? 1;
+    this.serial = options.serial ?? DEFAULT_SERIAL;
   }
 
   writeHeaders(options: { tags?: Uint8Array; head?: Uint8Array } = {}): this {
@@ -245,6 +247,7 @@ export class OggFileBuilder {
     const idLacing = lacePackets([head]);
     this.pages.push(
       buildRawPage({
+        serial: this.serial,
         sequence: this.sequence++,
         flags: FLAG_BOS,
         granule: 0n,
@@ -255,6 +258,7 @@ export class OggFileBuilder {
     const tagsLacing = lacePackets([tags]);
     this.pages.push(
       buildRawPage({
+        serial: this.serial,
         sequence: this.sequence++,
         flags: 0,
         granule: 0n,
@@ -288,6 +292,7 @@ export class OggFileBuilder {
       const lacing = lacePackets(slice);
       this.pages.push(
         buildRawPage({
+          serial: this.serial,
           sequence: this.sequence++,
           flags: eos ? FLAG_EOS : 0,
           granule: BigInt(granule),
@@ -321,7 +326,7 @@ export class OggFileBuilder {
           granule: spec.granule,
           segments: Uint8Array.from(spec.segments),
           body: spec.body,
-          ...(spec.serial !== undefined ? { serial: spec.serial } : {}),
+          serial: spec.serial ?? this.serial,
           ...(spec.crcOverride !== undefined ? { crcOverride: spec.crcOverride } : {}),
         }),
       );
@@ -361,6 +366,7 @@ export class OggFileBuilder {
     this.accumulated += granuleA;
     this.pages.push(
       buildRawPage({
+        serial: this.serial,
         sequence: this.sequence++,
         flags: 0,
         granule: before.length > 0 ? BigInt(this.accumulated) : -1n,
@@ -378,6 +384,7 @@ export class OggFileBuilder {
     const eos = options.eos ?? true;
     this.pages.push(
       buildRawPage({
+        serial: this.serial,
         sequence: this.sequence++,
         flags: FLAG_CONTINUED | (eos ? FLAG_EOS : 0),
         granule: BigInt(this.accumulated),
